@@ -102,6 +102,7 @@ runs:
         INPUT_MIGRATIONS: ${{ inputs.migrations }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         EVENT_BEFORE: ${{ github.event.before }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
       run: |
         # GitHub runs this with bash -e; Crux's exit code (2 when it finds problems) is kept and acted on in the last step,
         # after the comment, so it must not stop this one.
@@ -119,6 +120,7 @@ runs:
         args=(check --base "$base" --head HEAD --no-github --fail-on "$INPUT_FAIL_ON"
               --out "$RUNNER_TEMP/crux-check.md" --summary "$GITHUB_STEP_SUMMARY" --annotations github)
         if [ -n "$INPUT_MIGRATIONS" ]; then args+=(--migrations "$INPUT_MIGRATIONS"); fi
+        if [ -n "${PR_NUMBER:-}" ]; then args+=(--label "pull request #$PR_NUMBER"); fi
         "$CRUX_BIN" "${args[@]}"
         code=$?
         echo "report=$RUNNER_TEMP/crux-check.md" >> "$GITHUB_OUTPUT"
