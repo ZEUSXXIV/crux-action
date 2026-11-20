@@ -103,6 +103,9 @@ runs:
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         EVENT_BEFORE: ${{ github.event.before }}
       run: |
+        # GitHub runs this with bash -e; Crux's exit code (2 when it finds problems) is kept and acted on in the last step,
+        # after the comment, so it must not stop this one.
+        set +e
         set -uo pipefail
         # The check reads both sides from git, back to where the branch started.
         if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch --quiet --unshallow || true; fi
@@ -124,7 +127,7 @@ runs:
         exit 0
 
     - name: Comment on the pull request
-      if: inputs.comment == 'true' && github.event.pull_request.number != ''
+      if: ${{ !cancelled() && inputs.comment == 'true' && github.event.pull_request.number != '' }}
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -157,6 +160,7 @@ runs:
       run: docker rm -f crux-sql > /dev/null 2>&1 || true
 
     - name: Result
+      if: ${{ !cancelled() }}
       shell: bash
       run: |
         code="${CRUX_EXIT:-1}"
