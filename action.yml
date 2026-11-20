@@ -1,0 +1,167 @@
+name: Crux migration check
+description: Runs a pull request's SQL Server migrations in a throwaway database and comments with what they break, before they are merged.
+author: ZEUSXXIV
+branding:
+  icon: database
+  color: orange
+
+inputs:
+  migrations:
+    description: The migrations folder, relative to the repository. Several can be separated with semicolons. Found automatically when left empty.
+    default: ''
+  base:
+    description: The branch or commit the change is compared with. Defaults to the pull request's base branch, or the previous commit on a push.
+    default: ''
+  fail-on:
+    description: Fail the check on `error` (the default), `warning`, or `never`.
+    default: error
+  comment:
+    description: Comment on the pull request with the report, updating the same comment on each push.
+    default: 'true'
+  sandbox:
+    description: Run the change's new scripts in a throwaway SQL Server, not just read them. Set to false for a read-only check.
+    default: 'true'
+  version:
+    description: The Crux version to use, such as 0.5.3, or latest.
+    default: latest
+  crux:
+    description: A Crux for Linux already on the runner (the executable, or crux-linux-x64.tar.gz) instead of downloading one. For testing.
+    default: ''
+  sql-server-image:
+    description: The SQL Server container to run the sandbox in.
+    default: mcr.microsoft.com/mssql/server:2022-latest
+  github-token:
+    description: Used to comment on the pull request. Needs pull-requests write permission.
+    default: ${{ github.token }}
+
+outputs:
+  result:
+    description: passed or failed.
+    value: ${{ steps.check.outputs.result }}
+  report:
+    description: The path of the Markdown report.
+    value: ${{ steps.check.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Get Crux
+      shell: bash
+      env:
+        CRUX_INPUT: ${{ inputs.crux }}
+        CRUX_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/crux-bin"
+        mkdir -p "$dir"
+        if [ -n "$CRUX_INPUT" ]; then
+          case "$CRUX_INPUT" in
+            *.tar.gz) tar -xzf "$CRUX_INPUT" -C "$dir" ;;
+            *) cp "$CRUX_INPUT" "$dir/Crux" ;;
+          esac
+        else
+          if [ "$CRUX_VERSION" = latest ]; then
+            base="https://github.com/ZEUSXXIV/crux-downloads/releases/latest/download"
+          else
+            base="https://github.com/ZEUSXXIV/crux-downloads/releases/download/v${CRUX_VERSION#v}"
+          fi
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/crux-linux-x64.tar.gz" "$base/crux-linux-x64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/crux-linux-x64.tar.gz.sha256" "$base/crux-linux-x64.tar.gz.sha256"
+          # The download must be the release's own file.
+          (cd "$RUNNER_TEMP" && sha256sum -c crux-linux-x64.tar.gz.sha256)
+          tar -xzf "$RUNNER_TEMP/crux-linux-x64.tar.gz" -C "$dir"
+        fi
+        chmod +x "$dir/Crux"
+        echo "CRUX_BIN=$dir/Crux" >> "$GITHUB_ENV"
+
+    - name: Start a throwaway SQL Server
+      if: inputs.sandbox == 'true'
+      shell: bash
+      env:
+        SQL_IMAGE: ${{ inputs.sql-server-image }}
+      run: |
+        set -euo pipefail
+        # A server that lives only for this job. The password is made here, never stored, and hidden from the log.
+        password="Crux-$(openssl rand -hex 12)-a1A"
+        echo "::add-mask::$password"
+        docker run -d --name crux-sql -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=$password" -p 1433:1433 "$SQL_IMAGE" > /dev/null
+        for i in $(seq 1 90); do
+          if docker logs crux-sql 2>&1 | grep -q "SQL Server is now ready for client connections"; then break; fi
+          if [ "$i" = 90 ]; then echo "::error title=Crux::SQL Server did not start in time."; docker logs crux-sql | tail -20; exit 1; fi
+          sleep 2
+        done
+        # Ready for connections is logged a moment before the server's own databases have started.
+        sleep 5
+        echo "CRUX_SANDBOX=Server=localhost,1433;User Id=sa;Password=$password;TrustServerCertificate=true;Initial Catalog=crux_sandbox_ci;Connect Timeout=30" >> "$GITHUB_ENV"
+
+    - name: Check the migrations
+      id: check
+      shell: bash
+      env:
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_MIGRATIONS: ${{ inputs.migrations }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        EVENT_BEFORE: ${{ github.event.before }}
+      run: |
+        set -uo pipefail
+        # The check reads both sides from git, back to where the branch started.
+        if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch --quiet --unshallow || true; fi
+        base="$INPUT_BASE"
+        if [ -z "$base" ] && [ -n "${GITHUB_BASE_REF:-}" ]; then
+          git fetch --quiet origin "$GITHUB_BASE_REF" || true
+          base="origin/$GITHUB_BASE_REF"
+        fi
+        if [ -z "$base" ] && [ -n "${EVENT_BEFORE:-}" ] && [ "$EVENT_BEFORE" != 0000000000000000000000000000000000000000 ]; then base="$EVENT_BEFORE"; fi
+        if [ -z "$base" ]; then base="HEAD^"; fi
+        args=(check --base "$base" --head HEAD --no-github --fail-on "$INPUT_FAIL_ON"
+              --out "$RUNNER_TEMP/crux-check.md" --summary "$GITHUB_STEP_SUMMARY" --annotations github)
+        if [ -n "$INPUT_MIGRATIONS" ]; then args+=(--migrations "$INPUT_MIGRATIONS"); fi
+        "$CRUX_BIN" "${args[@]}"
+        code=$?
+        echo "report=$RUNNER_TEMP/crux-check.md" >> "$GITHUB_OUTPUT"
+        echo "CRUX_EXIT=$code" >> "$GITHUB_ENV"
+        if [ "$code" = 0 ]; then echo "result=passed" >> "$GITHUB_OUTPUT"; else echo "result=failed" >> "$GITHUB_OUTPUT"; fi
+        exit 0
+
+    - name: Comment on the pull request
+      if: inputs.comment == 'true' && github.event.pull_request.number != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        set -uo pipefail
+        report="$RUNNER_TEMP/crux-check.md"
+        [ -f "$report" ] || { echo "No report to post."; exit 0; }
+        marker="<!-- crux-check -->"
+        body="$RUNNER_TEMP/crux-comment.md"
+        run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        { echo "$marker"; cat "$report"; echo; echo "<sub>Updated for $(git rev-parse --short HEAD) · [run]($run)</sub>"; } > "$body"
+        # GitHub keeps comments under 65,536 characters; a longer report is cut, and is whole on the run's page.
+        if [ "$(wc -c < "$body")" -gt 60000 ]; then
+          { head -c 58000 "$body"; echo; echo; echo "_The report is cut short here. The whole report is in the [run's summary]($run)._"; } > "$body.cut" && mv "$body.cut" "$body"
+        fi
+        existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" 2>/dev/null | head -n 1)
+        if [ -n "$existing" ]; then
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F "body=@$body" > /dev/null \
+            || echo "::notice title=Crux::Could not update the comment (a pull request from a fork has no permission). The report is in the run's summary."
+        else
+          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F "body=@$body" > /dev/null \
+            || echo "::notice title=Crux::Could not comment (a pull request from a fork has no permission, or pull-requests: write is missing). The report is in the run's summary."
+        fi
+
+    - name: Stop SQL Server
+      if: always() && inputs.sandbox == 'true'
+      shell: bash
+      run: docker rm -f crux-sql > /dev/null 2>&1 || true
+
+    - name: Result
+      shell: bash
+      run: |
+        code="${CRUX_EXIT:-1}"
+        case "$code" in
+          0) echo "Crux found nothing that stops this change." ;;
+          2) echo "::error title=Crux::Crux found problems in this change's migrations. See the comment or the run's summary."; exit 1 ;;
+          *) echo "::error title=Crux::Crux could not check the migrations (exit $code). See the log above."; exit 1 ;;
+        esac
