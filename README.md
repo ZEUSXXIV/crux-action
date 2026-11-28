@@ -73,4 +73,5 @@ SQL Server migrations in the common layouts: Flyway (`V1__name.sql`, with placeh
 
 ## License
 
-The files in this repository are under the MIT license. Crux itself is downloaded from its releases, under its own terms.
+The files in this repository are under the MIT license. Crux itself, which the action downloads from its releases, is
+proprietary and free to use while it is a preview, under the [Crux End-User Licence Agreement](https://github.com/ZEUSXXIV/crux-downloads/blob/main/EULA.md).
